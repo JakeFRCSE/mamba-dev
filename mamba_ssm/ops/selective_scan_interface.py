@@ -289,6 +289,7 @@ class MambaInnerFn(torch.autograd.Function):
             # Get current layer index
             current_layer = MAMBA_CONTROLLER["current_layer_idx"]
             mode = MAMBA_CONTROLLER.get("mode", None)
+            print(f"DEBUG: MambaInnerFn Called! Layer={current_layer}, Mode={mode}")
             
             if mode == 'analysis':
                 # Analysis mode: Calculate L2 norm and save to history
@@ -316,30 +317,37 @@ class MambaInnerFn(torch.autograd.Function):
             elif mode == 'steering':
                 # Steering mode: Apply delta amplification for target layers
                 target_layers = MAMBA_CONTROLLER.get("target_layers", [])
+                
+                # [디버깅 1] 현재 레이어 확인 (너무 많이 출력되면 39번 근처만 출력하게 조건 거세요)
+                if current_layer == 39:
+                   print(f"DEBUG: Hit Layer {current_layer}!")
+
                 if current_layer in target_layers:
                     steering_mask = MAMBA_CONTROLLER.get("steering_mask", None)
                     steering_factor = MAMBA_CONTROLLER.get("steering_factor", 1.5)
                     
                     if steering_mask is not None:
-                        try:
-                            # Broadcast mask from [Batch, Seq_Len] to [Batch, 1, Seq_Len]
-                            # to match delta shape [Batch, Dim, Seq_Len]
+                        # [디버깅 2] 마스크가 켜진 게 있는지 확인
+                        if steering_mask.sum() > 0:
+                            print(f"\n[Steering ACTIVATED] Layer: {current_layer}, Factor: {steering_factor}")
+                            print(f"Original Delta Mean: {delta.mean().item():.5f}")
+                            
+                            # Shape Check
                             batch_size, dim_size, seq_len = delta.shape
                             mask_batch, mask_seq_len = steering_mask.shape
                             
-                            # Ensure mask matches batch and sequence length
                             if mask_batch == batch_size and mask_seq_len == seq_len:
-                                # Expand mask: [Batch, Seq_Len] -> [Batch, 1, Seq_Len]
-                                mask_expanded = steering_mask.unsqueeze(1).to(delta.device)  # [B, 1, L]
+                                mask_expanded = steering_mask.unsqueeze(1).to(delta.device)
+                                bias_value = (steering_factor - 1.0) * 1.0 
                                 
-                                # Apply amplification: delta = delta * (1.0 + mask * (factor - 1.0))
-                                # This amplifies delta where mask is 1.0, leaves it unchanged where mask is 0.0
-                                delta = delta * (1.0 + mask_expanded * (steering_factor - 1.0))
+                                # Apply
+                                delta = delta + (mask_expanded * bias_value)
+                                delta = delta.contiguous()
+                                
+                                print(f"Steered Delta Mean: {delta.mean().item():.5f}")
                             else:
-                                print(f"[Delta steering shape mismatch]: delta shape {delta.shape}, mask shape {steering_mask.shape}")
-                        except Exception as e:
-                            print(f"[Delta steering failed]: {e}")
-                    # Note: If steering_mask is None, skip steering (as per requirements)
+                                print(f"[Shape Mismatch] Mask: {steering_mask.shape} vs Delta: {delta.shape}")
+                        
             
         except Exception as e:
             print(f"[Delta analysis/steering failed]: {e}")

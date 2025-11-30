@@ -10,7 +10,7 @@ from torch import Tensor
 
 from einops import rearrange, repeat
 
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn, MAMBA_CONTROLLER
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -185,6 +185,44 @@ class Mamba(nn.Module):
             dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+            
+            # ------------------------------------------------------------------
+            # [🔥 스티어링 로직 삽입 위치]
+            # dt가 계산되었고, 아직 state update(SSM)에 들어가기 전입니다.
+            # ------------------------------------------------------------------
+            try:
+                current_layer = self.layer_idx # Mamba 모듈은 자신의 layer 인덱스를 알고 있음
+                target_layers = MAMBA_CONTROLLER.get("target_layers", [])
+                mode = MAMBA_CONTROLLER.get("mode", None)
+
+                # 디버깅용 (필요시 주석 해제)
+                # print(f"DEBUG: Step Layer {current_layer}, Mode {mode}")
+
+                if mode == 'steering' and current_layer in target_layers:
+                    steering_mask = MAMBA_CONTROLLER.get("steering_mask", None)
+                    steering_factor = MAMBA_CONTROLLER.get("steering_factor", 1.5)
+
+                    if steering_mask is not None:
+                        # step 메서드에서 dt는 [Batch, Dim] 형태입니다. (Seq_Len 차원이 없음 or 1)
+                        # steering_mask는 [Batch, 1] 형태입니다.
+                        
+                        # 차원 맞추기 (Batch 확인)
+                        if steering_mask.shape[0] == dt.shape[0]:
+                            # 마스크가 1인 경우만 적용
+                            if steering_mask.sum() > 0:
+                                print(f"  --> Steering Layer {current_layer}!")
+                                
+                                bias_value = (steering_factor - 1.0) * 1.0
+                                
+                                # steering_mask: [B, 1] -> [B, 1]
+                                # dt: [B, D]
+                                # Broadcasting을 위해 마스크 사용
+                                dt = dt + (steering_mask * bias_value)
+                                
+            except Exception as e:
+                print(f"Steering Error in step: {e}")
+            # ============================================================
+            
             assert self.activation in ["silu", "swish"]
             y = selective_scan_fn(
                 x,
@@ -203,6 +241,17 @@ class Mamba(nn.Module):
                 ssm_state.copy_(last_state)
             y = rearrange(y, "b d l -> b l d")
             out = self.out_proj(y)
+            
+            # ============================================================
+            # [Add] Layer counter increment for else path
+            # ============================================================
+            try:
+                max_layers = MAMBA_CONTROLLER.get("max_layers", 64)
+                next_idx = (MAMBA_CONTROLLER.get("current_layer_idx", 0) + 1) % max_layers
+                MAMBA_CONTROLLER["current_layer_idx"] = next_idx
+            except Exception as e:
+                pass
+            # ============================================================
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):
@@ -235,6 +284,32 @@ class Mamba(nn.Module):
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 
         # SSM step
+        # ============================================================
+        # [Add] Delta analysis and steering logic for step method
+        # ============================================================
+        try:
+            # self.layer_idx가 Mamba __init__에서 저장되어 있습니다.
+            current_layer = self.layer_idx 
+            mode = MAMBA_CONTROLLER.get("mode", None)
+            # print(f"DEBUG: Mamba.step Called! Layer={current_layer}, Mode={mode}, LayerIdx={self.layer_idx}")
+            
+            if mode == 'steering':
+                target_layers = MAMBA_CONTROLLER.get("target_layers", [])
+                if current_layer in target_layers:
+                    steering_mask = MAMBA_CONTROLLER.get("steering_mask", None)
+                    steering_factor = MAMBA_CONTROLLER.get("steering_factor", 1.5)
+                    
+                    if steering_mask is not None and steering_mask.sum() > 0:
+                        print(f"[Steering ACTIVATED in step] Layer: {current_layer}, Factor: {steering_factor}")
+                        # dt shape: (B, d_inner), steering_mask shape: (B, 1)
+                        if steering_mask.shape[0] == dt.shape[0] and steering_mask.shape[1] == 1:
+                            print(f"  --> Steering Layer {current_layer}!")
+                            bias_value = (steering_factor - 1.0) * 1.0
+                            dt = dt + (steering_mask.to(dt.device) * bias_value)
+        except Exception as e:
+            print(f"[Delta steering failed in step]: {e}")
+        # ============================================================
+        
         if selective_state_update is None:
             # Discretize A and B
             dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
@@ -250,6 +325,18 @@ class Mamba(nn.Module):
             )
 
         out = self.out_proj(y)
+        
+        # ============================================================
+        # [Add] Layer counter increment for step method
+        # ============================================================
+        try:
+            max_layers = MAMBA_CONTROLLER.get("max_layers", 64)
+            next_idx = (MAMBA_CONTROLLER.get("current_layer_idx", 0) + 1) % max_layers
+            MAMBA_CONTROLLER["current_layer_idx"] = next_idx
+        except Exception as e:
+            pass
+        # ============================================================
+        
         return out.unsqueeze(1), conv_state, ssm_state
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
