@@ -6,6 +6,12 @@ from mamba_ssm.utils.torch import custom_bwd, custom_fwd
 
 from einops import rearrange, repeat
 
+# ==========================================
+# [추가] 데이터를 저장할 전역 리스트 선언
+# 모델이 돌면서 계산한 Delta Score들이 여기에 차곡차곡 쌓입니다.
+# ==========================================
+DELTA_SCORES_HISTORY = []
+
 try:
     from causal_conv1d import causal_conv1d_fn
     from causal_conv1d.cpp_functions import causal_conv1d_fwd_function, causal_conv1d_bwd_function, causal_conv1d_update_function
@@ -259,6 +265,35 @@ class MambaInnerFn(torch.autograd.Function):
             delta = rearrange(delta, "b d l -> (b l) d", l=L).contiguous()
             delta = rms_norm_forward(delta, dt_rms_weight, bias=None, eps=b_c_dt_rms_eps)
             delta = rearrange(delta, "(b l) d -> b d l", l=L).contiguous()
+        
+        # ============================================================
+        # [추가] L2 Norm 계산 및 저장 로직 (연구용 Hook)
+        # ============================================================
+        try:
+            # A. Softplus 적용 (음수 -> 양수 시간 간격 변환)
+            # delta_bias가 있는 경우 먼저 적용
+            delta_for_score = delta
+            if delta_bias is not None:
+                delta_for_score = delta + delta_bias[..., None]
+            
+            # Softplus 적용 (delta_softplus=True인 경우만, 보통 True)
+            if delta_softplus:
+                actual_delta = F.softplus(delta_for_score)
+            else:
+                actual_delta = delta_for_score
+            
+            # B. L2 Norm 적용 (차원 축소)
+            # Dim 축(1번)을 기준으로 Norm을 구합니다.
+            # 결과 shape: [Batch, Length] -> 토큰별 '업데이트 에너지' 총량
+            l2_score = torch.norm(actual_delta, p=2, dim=1)
+            
+            # C. CPU로 옮겨서 저장 (GPU 메모리 절약)
+            # 리스트에 [Batch, Length] 텐서를 추가합니다.
+            DELTA_SCORES_HISTORY.append(l2_score.detach().cpu())
+            
+        except Exception as e:
+            print(f"[Delta saving failed]: {e}")
+        # ============================================================
         
         out, scan_intermediates, out_z = selective_scan_cuda.fwd(
             conv1d_out, delta, A, B, C, D, z, delta_bias, delta_softplus
