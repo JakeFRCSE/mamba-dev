@@ -7,8 +7,8 @@ from mamba_ssm.utils.torch import custom_bwd, custom_fwd
 from einops import rearrange, repeat
 
 # ==========================================
-# [추가] 데이터를 저장할 전역 리스트 선언
-# 모델이 돌면서 계산한 Delta Score들이 여기에 차곡차곡 쌓입니다.
+# [Add] Global list to store data
+# The model calculates the Delta Score and stores it here.
 # ==========================================
 DELTA_SCORES_HISTORY = []
 
@@ -267,28 +267,28 @@ class MambaInnerFn(torch.autograd.Function):
             delta = rearrange(delta, "(b l) d -> b d l", l=L).contiguous()
         
         # ============================================================
-        # [추가] L2 Norm 계산 및 저장 로직 (연구용 Hook)
+        # [Add] L2 Norm calculation and saving logic (research hook)
         # ============================================================
         try:
-            # A. Softplus 적용 (음수 -> 양수 시간 간격 변환)
-            # delta_bias가 있는 경우 먼저 적용
+            # A. Softplus applied (negative -> positive time interval conversion)
+            # Apply delta_bias first if it exists
             delta_for_score = delta
             if delta_bias is not None:
                 delta_for_score = delta + delta_bias[..., None]
             
-            # Softplus 적용 (delta_softplus=True인 경우만, 보통 True)
+            # Softplus applied (only if delta_softplus=True, usually True)
             if delta_softplus:
                 actual_delta = F.softplus(delta_for_score)
             else:
                 actual_delta = delta_for_score
             
-            # B. L2 Norm 적용 (차원 축소)
-            # Dim 축(1번)을 기준으로 Norm을 구합니다.
-            # 결과 shape: [Batch, Length] -> 토큰별 '업데이트 에너지' 총량
+            # B. L2 Norm applied (dimension reduction)
+            # Dim axis (1st) as basis for Norm
+            # Result shape: [Batch, Length] -> Total 'update energy' per token
             l2_score = torch.norm(actual_delta, p=2, dim=1)
             
-            # C. CPU로 옮겨서 저장 (GPU 메모리 절약)
-            # 리스트에 [Batch, Length] 텐서를 추가합니다.
+            # C. Move to CPU to save memory (GPU memory saving)
+            # Add [Batch, Length] tensor to the list.
             DELTA_SCORES_HISTORY.append(l2_score.detach().cpu())
             
         except Exception as e:
