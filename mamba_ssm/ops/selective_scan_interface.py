@@ -12,6 +12,22 @@ from einops import rearrange, repeat
 # ==========================================
 DELTA_SCORES_HISTORY = []
 
+# ==========================================
+# [Add] Global controller for inference-time delta steering
+# ==========================================
+MAMBA_CONTROLLER = {
+    "mode": None,              # 'analysis' | 'steering' | None
+    "target_layers": [],       # List of layer indices (e.g., [39])
+    "steering_factor": 1.5,    # Float (Amplification factor)
+    "steering_mask": None,     # Tensor [Batch, Seq_Len] (1.0 for target tokens, 0.0 for others)
+    "current_layer_idx": 0,    # Int (To track layer depth during inference)
+    "max_layers": 64           # Int (Max layers for modulo operation)
+}
+
+def reset_mamba_controller():
+    """Reset the current layer index in MAMBA_CONTROLLER."""
+    MAMBA_CONTROLLER["current_layer_idx"] = 0
+
 try:
     from causal_conv1d import causal_conv1d_fn
     from causal_conv1d.cpp_functions import causal_conv1d_fwd_function, causal_conv1d_bwd_function, causal_conv1d_update_function
@@ -267,32 +283,72 @@ class MambaInnerFn(torch.autograd.Function):
             delta = rearrange(delta, "(b l) d -> b d l", l=L).contiguous()
         
         # ============================================================
-        # [Add] L2 Norm calculation and saving logic (research hook)
+        # [Add] Delta analysis and steering logic
         # ============================================================
         try:
-            # A. Softplus applied (negative -> positive time interval conversion)
-            # Apply delta_bias first if it exists
-            delta_for_score = delta
-            if delta_bias is not None:
-                delta_for_score = delta + delta_bias[..., None]
+            # Get current layer index
+            current_layer = MAMBA_CONTROLLER["current_layer_idx"]
+            mode = MAMBA_CONTROLLER.get("mode", None)
             
-            # Softplus applied (only if delta_softplus=True, usually True)
-            if delta_softplus:
-                actual_delta = F.softplus(delta_for_score)
-            else:
-                actual_delta = delta_for_score
-            
-            # B. L2 Norm applied (dimension reduction)
-            # Dim axis (1st) as basis for Norm
-            # Result shape: [Batch, Length] -> Total 'update energy' per token
-            l2_score = torch.norm(actual_delta, p=2, dim=1)
-            
-            # C. Move to CPU to save memory (GPU memory saving)
-            # Add [Batch, Length] tensor to the list.
-            DELTA_SCORES_HISTORY.append(l2_score.detach().cpu())
+            if mode == 'analysis':
+                # Analysis mode: Calculate L2 norm and save to history
+                # A. Softplus applied (negative -> positive time interval conversion)
+                # Apply delta_bias first if it exists
+                delta_for_score = delta
+                if delta_bias is not None:
+                    delta_for_score = delta + delta_bias[..., None]
+                
+                # Softplus applied (only if delta_softplus=True, usually True)
+                if delta_softplus:
+                    actual_delta = F.softplus(delta_for_score)
+                else:
+                    actual_delta = delta_for_score
+                
+                # B. L2 Norm applied (dimension reduction)
+                # Dim axis (1st) as basis for Norm
+                # Result shape: [Batch, Length] -> Total 'update energy' per token
+                l2_score = torch.norm(actual_delta, p=2, dim=1)
+                
+                # C. Move to CPU to save memory (GPU memory saving)
+                # Add [Batch, Length] tensor to the list.
+                DELTA_SCORES_HISTORY.append(l2_score.detach().cpu())
+                
+            elif mode == 'steering':
+                # Steering mode: Apply delta amplification for target layers
+                target_layers = MAMBA_CONTROLLER.get("target_layers", [])
+                if current_layer in target_layers:
+                    steering_mask = MAMBA_CONTROLLER.get("steering_mask", None)
+                    steering_factor = MAMBA_CONTROLLER.get("steering_factor", 1.5)
+                    
+                    if steering_mask is not None:
+                        try:
+                            # Broadcast mask from [Batch, Seq_Len] to [Batch, 1, Seq_Len]
+                            # to match delta shape [Batch, Dim, Seq_Len]
+                            batch_size, dim_size, seq_len = delta.shape
+                            mask_batch, mask_seq_len = steering_mask.shape
+                            
+                            # Ensure mask matches batch and sequence length
+                            if mask_batch == batch_size and mask_seq_len == seq_len:
+                                # Expand mask: [Batch, Seq_Len] -> [Batch, 1, Seq_Len]
+                                mask_expanded = steering_mask.unsqueeze(1).to(delta.device)  # [B, 1, L]
+                                
+                                # Apply amplification: delta = delta * (1.0 + mask * (factor - 1.0))
+                                # This amplifies delta where mask is 1.0, leaves it unchanged where mask is 0.0
+                                delta = delta * (1.0 + mask_expanded * (steering_factor - 1.0))
+                            else:
+                                print(f"[Delta steering shape mismatch]: delta shape {delta.shape}, mask shape {steering_mask.shape}")
+                        except Exception as e:
+                            print(f"[Delta steering failed]: {e}")
+                    # Note: If steering_mask is None, skip steering (as per requirements)
             
         except Exception as e:
-            print(f"[Delta saving failed]: {e}")
+            print(f"[Delta analysis/steering failed]: {e}")
+
+        finally:
+            # Layer Counter Increment
+            max_layers = MAMBA_CONTROLLER.get("max_layers", 64)
+            next_idx = (MAMBA_CONTROLLER.get("current_layer_idx", 0) + 1) % max_layers
+            MAMBA_CONTROLLER["current_layer_idx"] = next_idx
         # ============================================================
         
         out, scan_intermediates, out_z = selective_scan_cuda.fwd(
