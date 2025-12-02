@@ -221,12 +221,12 @@ class Mamba(nn.Module):
                                 # Use mask for broadcasting
                                 dt = dt + (steering_mask * steering_factor)
 
-                    if MAMBA_CONTROLLER.get("record_delta", False):
-                        dt_for_score = dt
-                        bias = self.dt_proj.bias.view(1, -1, 1).to(dtype=dt_for_score.dtype, device=dt_for_score.device)
-                        dt_for_score = F.softplus(dt_for_score + bias)
-                        l2_score = torch.norm(dt_for_score, p=2, dim=1)  # (B, L)
-                        DELTA_SCORES_HISTORY.append(l2_score.detach().cpu())            
+                if MAMBA_CONTROLLER.get("record_delta", False):
+                    dt_for_score = dt
+                    bias = self.dt_proj.bias.view(1, -1, 1).to(dtype=dt_for_score.dtype, device=dt_for_score.device)
+                    dt_for_score = F.softplus(dt_for_score + bias)
+                    l2_score = torch.norm(dt_for_score, p=2, dim=1)  # (B, L)
+                    DELTA_SCORES_HISTORY.append(l2_score.detach().cpu())            
             except Exception as e:
                 print(f"Steering Error in step: {e}")
             # ============================================================
