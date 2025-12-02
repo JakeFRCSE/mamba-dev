@@ -288,75 +288,50 @@ class MambaInnerFn(torch.autograd.Function):
         try:
             # Get current layer index
             current_layer = MAMBA_CONTROLLER["current_layer_idx"]
+            target_layers = MAMBA_CONTROLLER.get("target_layers", [])
             mode = MAMBA_CONTROLLER.get("mode", None)
-            print(f"DEBUG: MambaInnerFn Called! Layer={current_layer}, Mode={mode}")
+            # [Debug] Print the layer number and mode
+            # print(f"DEBUG: MambaInnerFn Called! Layer={current_layer}, Mode={mode}")
             
             if mode == 'analysis':
                 # Analysis mode: Calculate L2 norm and save to history
-                # A. Softplus applied (negative -> positive time interval conversion)
+                # Softplus applied (negative -> positive time interval conversion)
                 # Apply delta_bias first if it exists
                 delta_for_score = delta
                 if delta_bias is not None:
                     delta_for_score = delta + delta_bias[..., None]
                 
-                # Softplus applied (only if delta_softplus=True, usually True)
+                # Softplus applied
                 if delta_softplus:
                     actual_delta = F.softplus(delta_for_score)
                 else:
                     actual_delta = delta_for_score
                 
-                # B. L2 Norm applied (dimension reduction)
-                # Dim axis (1st) as basis for Norm
-                # Result shape: [Batch, Length] -> Total 'update energy' per token
+                # L2 Norm applied
+                # Dim axis (1st: dim) as basis for Norm
+                # Result shape: [Batch, Length]
                 l2_score = torch.norm(actual_delta, p=2, dim=1)
                 
-                # C. Move to CPU to save memory (GPU memory saving)
+                # Move to CPU to save memory (GPU memory saving)
                 # Add [Batch, Length] tensor to the list.
                 DELTA_SCORES_HISTORY.append(l2_score.detach().cpu())
                 
-            elif mode == 'steering':
+            elif mode == 'steering' and current_layer in target_layers:
                 # Steering mode: Apply delta amplification for target layers
                 target_layers = MAMBA_CONTROLLER.get("target_layers", [])
                 
-                # [디버깅 1] 현재 레이어 확인 (너무 많이 출력되면 39번 근처만 출력하게 조건 거세요)
-                if current_layer == 39:
-                   print(f"DEBUG: Hit Layer {current_layer}!")
-
                 if current_layer in target_layers:
+
                     steering_mask = MAMBA_CONTROLLER.get("steering_mask", None)
-                    steering_factor = MAMBA_CONTROLLER.get("steering_factor", 1.5)
+                    steering_factor = MAMBA_CONTROLLER.get("steering_factor", 1.2)
                     
                     if steering_mask is not None:
-                        # [디버깅 2] 마스크가 켜진 게 있는지 확인
-                        if steering_mask.sum() > 0:
-                            print(f"\n[Steering ACTIVATED] Layer: {current_layer}, Factor: {steering_factor}")
-                            print(f"Original Delta Mean: {delta.mean().item():.5f}")
-                            
-                            # Shape Check
-                            batch_size, dim_size, seq_len = delta.shape
-                            mask_batch, mask_seq_len = steering_mask.shape
-                            
-                            if mask_batch == batch_size and mask_seq_len == seq_len:
-                                mask_expanded = steering_mask.unsqueeze(1).to(delta.device)
-                                bias_value = (steering_factor - 1.0) * 1.0 
-                                
-                                # Apply
-                                delta = delta + (mask_expanded * bias_value)
-                                delta = delta.contiguous()
-                                
-                                print(f"Steered Delta Mean: {delta.mean().item():.5f}")
-                            else:
-                                print(f"[Shape Mismatch] Mask: {steering_mask.shape} vs Delta: {delta.shape}")
-                        
-            
-        except Exception as e:
-            print(f"[Delta analysis/steering failed]: {e}")
+                        if steering_mask.shape[0] == delta.shape[0]:
+                            if steering_mask.sum() > 0:
+                                delta = delta + (steering_mask * steering_factor)
 
-        finally:
-            # Layer Counter Increment
-            max_layers = MAMBA_CONTROLLER.get("max_layers", 64)
-            next_idx = (MAMBA_CONTROLLER.get("current_layer_idx", 0) + 1) % max_layers
-            MAMBA_CONTROLLER["current_layer_idx"] = next_idx
+        except Exception as e:
+            print(f"[Delta analysis/steering failed in MambaInnerFn]: {e}")
         # ============================================================
         
         out, scan_intermediates, out_z = selective_scan_cuda.fwd(

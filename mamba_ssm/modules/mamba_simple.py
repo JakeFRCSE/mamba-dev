@@ -10,7 +10,12 @@ from torch import Tensor
 
 from einops import rearrange, repeat
 
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn, MAMBA_CONTROLLER
+from mamba_ssm.ops.selective_scan_interface import (
+    selective_scan_fn,
+    mamba_inner_fn,
+    MAMBA_CONTROLLER,
+    DELTA_SCORES_HISTORY,  # Use the shared global history defined in selective_scan_interface
+)
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -26,7 +31,6 @@ try:
     from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
-
 
 class Mamba(nn.Module):
     def __init__(
@@ -187,38 +191,42 @@ class Mamba(nn.Module):
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             
             # ------------------------------------------------------------------
-            # [🔥 스티어링 로직 삽입 위치]
-            # dt가 계산되었고, 아직 state update(SSM)에 들어가기 전입니다.
+            # [Add] Steering logic insertion point
+            # dt is calculated and before entering state update (SSM).
             # ------------------------------------------------------------------
             try:
-                current_layer = self.layer_idx # Mamba 모듈은 자신의 layer 인덱스를 알고 있음
+                current_layer = self.layer_idx 
                 target_layers = MAMBA_CONTROLLER.get("target_layers", [])
                 mode = MAMBA_CONTROLLER.get("mode", None)
 
-                # 디버깅용 (필요시 주석 해제)
+                # For debugging (uncomment if needed)
                 # print(f"DEBUG: Step Layer {current_layer}, Mode {mode}")
 
                 if mode == 'steering' and current_layer in target_layers:
                     steering_mask = MAMBA_CONTROLLER.get("steering_mask", None)
-                    steering_factor = MAMBA_CONTROLLER.get("steering_factor", 1.5)
+                    steering_factor = MAMBA_CONTROLLER.get("steering_factor", 1.2)
 
                     if steering_mask is not None:
-                        # step 메서드에서 dt는 [Batch, Dim] 형태입니다. (Seq_Len 차원이 없음 or 1)
-                        # steering_mask는 [Batch, 1] 형태입니다.
-                        
-                        # 차원 맞추기 (Batch 확인)
+                        # In step method, dt is in [Batch, Dim] shape.
+                        # steering_mask is in [Batch, 1] shape.
+
+                        # Dimension alignment (Batch check)
                         if steering_mask.shape[0] == dt.shape[0]:
-                            # 마스크가 1인 경우만 적용
+                            # Apply only when mask is 1
                             if steering_mask.sum() > 0:
-                                print(f"  --> Steering Layer {current_layer}!")
-                                
-                                bias_value = (steering_factor - 1.0) * 1.0
-                                
-                                # steering_mask: [B, 1] -> [B, 1]
+                                # [Debug] Print the layer number
+                                # print(f"  --> Steering Layer {current_layer}!")
+                                # steering_mask: [B, 1]
                                 # dt: [B, D]
-                                # Broadcasting을 위해 마스크 사용
-                                dt = dt + (steering_mask * bias_value)
-                                
+                                # Use mask for broadcasting
+                                dt = dt + (steering_mask * steering_factor)
+
+                    if MAMBA_CONTROLLER.get("record_delta", False):
+                        dt_for_score = dt
+                        bias = self.dt_proj.bias.view(1, -1, 1).to(dtype=dt_for_score.dtype, device=dt_for_score.device)
+                        dt_for_score = F.softplus(dt_for_score + bias)
+                        l2_score = torch.norm(dt_for_score, p=2, dim=1)  # (B, L)
+                        DELTA_SCORES_HISTORY.append(l2_score.detach().cpu())            
             except Exception as e:
                 print(f"Steering Error in step: {e}")
             # ============================================================
@@ -283,31 +291,39 @@ class Mamba(nn.Module):
         dt = F.linear(dt, self.dt_proj.weight)  # (B d_inner)
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 
-        # SSM step
         # ============================================================
-        # [Add] Delta analysis and steering logic for step method
+        # [Add] Steering logic insertion point
         # ============================================================
         try:
-            # self.layer_idx가 Mamba __init__에서 저장되어 있습니다.
             current_layer = self.layer_idx 
             mode = MAMBA_CONTROLLER.get("mode", None)
-            # print(f"DEBUG: Mamba.step Called! Layer={current_layer}, Mode={mode}, LayerIdx={self.layer_idx}")
+            target_layers = MAMBA_CONTROLLER.get("target_layers", [])
             
-            if mode == 'steering':
-                target_layers = MAMBA_CONTROLLER.get("target_layers", [])
-                if current_layer in target_layers:
-                    steering_mask = MAMBA_CONTROLLER.get("steering_mask", None)
-                    steering_factor = MAMBA_CONTROLLER.get("steering_factor", 1.5)
+            if mode == 'steering' and current_layer in target_layers:
+                
+                steering_mask = MAMBA_CONTROLLER.get("steering_mask", None)
+                steering_factor = MAMBA_CONTROLLER.get("steering_factor", 1.2)
                     
-                    if steering_mask is not None and steering_mask.sum() > 0:
-                        print(f"[Steering ACTIVATED in step] Layer: {current_layer}, Factor: {steering_factor}")
-                        # dt shape: (B, d_inner), steering_mask shape: (B, 1)
-                        if steering_mask.shape[0] == dt.shape[0] and steering_mask.shape[1] == 1:
-                            print(f"  --> Steering Layer {current_layer}!")
-                            bias_value = (steering_factor - 1.0) * 1.0
-                            dt = dt + (steering_mask.to(dt.device) * bias_value)
+                if steering_mask is not None:
+                    if steering_mask.shape[0] == dt.shape[0]:
+                        if steering_mask.sum() > 0:
+                            dt = dt + (steering_mask * steering_factor)
+
         except Exception as e:
-            print(f"[Delta steering failed in step]: {e}")
+            print(f"[Steering failed in step]: {e}")
+            pass
+
+        try:
+            if MAMBA_CONTROLLER.get("record_delta", False):
+                dt_for_score = dt
+                bias = self.dt_proj.bias.to(dtype=dt_for_score.dtype, device=dt_for_score.device)
+                dt_for_score = F.softplus(dt_for_score + bias)
+                l2_score = torch.norm(dt_for_score, p=2, dim=1)
+                # print(f"DEBUG: L2 Score: {l2_score.shape}")
+                DELTA_SCORES_HISTORY.append(l2_score.detach().cpu())            
+        except Exception as e:
+            print(f"[Recording delta failed in step]: {e}")
+
         # ============================================================
         
         if selective_state_update is None:
@@ -325,17 +341,7 @@ class Mamba(nn.Module):
             )
 
         out = self.out_proj(y)
-        
-        # ============================================================
-        # [Add] Layer counter increment for step method
-        # ============================================================
-        try:
-            max_layers = MAMBA_CONTROLLER.get("max_layers", 64)
-            next_idx = (MAMBA_CONTROLLER.get("current_layer_idx", 0) + 1) % max_layers
-            MAMBA_CONTROLLER["current_layer_idx"] = next_idx
-        except Exception as e:
-            pass
-        # ============================================================
+
         
         return out.unsqueeze(1), conv_state, ssm_state
 
