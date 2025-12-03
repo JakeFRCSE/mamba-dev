@@ -161,6 +161,7 @@ class Mamba(nn.Module):
                 self.D.float(),
                 delta_bias=self.dt_proj.bias.float(),
                 delta_softplus=True,
+                layer_idx=self.layer_idx,
             )
         else:
             x, z = xz.chunk(2, dim=1)
@@ -249,17 +250,6 @@ class Mamba(nn.Module):
                 ssm_state.copy_(last_state)
             y = rearrange(y, "b d l -> b l d")
             out = self.out_proj(y)
-            
-            # ============================================================
-            # [Add] Layer counter increment for else path
-            # ============================================================
-            try:
-                max_layers = MAMBA_CONTROLLER.get("max_layers", 64)
-                next_idx = (MAMBA_CONTROLLER.get("current_layer_idx", 0) + 1) % max_layers
-                MAMBA_CONTROLLER["current_layer_idx"] = next_idx
-            except Exception as e:
-                pass
-            # ============================================================
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):

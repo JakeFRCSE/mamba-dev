@@ -210,7 +210,7 @@ class MambaInnerFn(torch.autograd.Function):
     def forward(ctx, xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
                 out_proj_weight, out_proj_bias,
                 A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
-                C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1, b_rms_weight=None, c_rms_weight= None, dt_rms_weight= None, b_c_dt_rms_eps=1e-6):
+                C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1, b_rms_weight=None, c_rms_weight= None, dt_rms_weight= None, b_c_dt_rms_eps=1e-6, layer_idx=None):
         """
              xz: (batch, dim, seqlen)
         """
@@ -286,8 +286,8 @@ class MambaInnerFn(torch.autograd.Function):
         # [Add] Delta analysis and steering logic
         # ============================================================
         try:
-            # Get current layer index
-            current_layer = MAMBA_CONTROLLER["current_layer_idx"]
+            # Get current layer index (use layer_idx parameter if provided, otherwise fallback to global counter)
+            current_layer = layer_idx if layer_idx is not None else MAMBA_CONTROLLER.get("current_layer_idx", 0)
             target_layers = MAMBA_CONTROLLER.get("target_layers", [])
             mode = MAMBA_CONTROLLER.get("mode", None)
             # [Debug] Print the layer number and mode
@@ -441,18 +441,18 @@ class MambaInnerFn(torch.autograd.Function):
                 dA, dB, dC, dD,
                 ddelta_bias if delta_bias is not None else None,
                 # 6-None are delta_softplus, checkpoint_lvl, b_rms_weight, c_rms_weight, dt_rms_weight, b_c_dt_rms_eps
-                dB_proj_bias, dC_proj_bias, None, None, None, None, None, None)
+                dB_proj_bias, dC_proj_bias, None, None, None, None, None, None, None)
 
 
 def mamba_inner_fn(
     xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
     out_proj_weight, out_proj_bias,
     A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
-    C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1, b_rms_weight= None, c_rms_weight= None, dt_rms_weight= None, b_c_dt_rms_eps=1e-6
+    C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1, b_rms_weight= None, c_rms_weight= None, dt_rms_weight= None, b_c_dt_rms_eps=1e-6, layer_idx=None
 ):
     return MambaInnerFn.apply(xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
                               out_proj_weight, out_proj_bias,
-                              A, B, C, D, delta_bias, B_proj_bias, C_proj_bias, delta_softplus, checkpoint_lvl, b_rms_weight, c_rms_weight, dt_rms_weight, b_c_dt_rms_eps)
+                              A, B, C, D, delta_bias, B_proj_bias, C_proj_bias, delta_softplus, checkpoint_lvl, b_rms_weight, c_rms_weight, dt_rms_weight, b_c_dt_rms_eps, layer_idx)
 
 
 def mamba_inner_ref(
