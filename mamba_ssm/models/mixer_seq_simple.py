@@ -187,13 +187,18 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
-    def forward(self, input_ids, inference_params=None, **mixer_kwargs):
+    def forward(self, input_ids, inference_params=None, output_hidden_states=False, **mixer_kwargs):
         hidden_states = self.embedding(input_ids)
+        collected_hidden_states = []
+        if output_hidden_states:
+            collected_hidden_states.append(hidden_states)
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
+            if output_hidden_states:
+                collected_hidden_states.append(hidden_states)
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
@@ -209,6 +214,9 @@ class MixerModel(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
                 is_rms_norm=isinstance(self.norm_f, RMSNorm)
             )
+        if output_hidden_states:
+            collected_hidden_states.append(hidden_states)
+            return hidden_states, tuple(collected_hidden_states)
         return hidden_states
 
 
@@ -271,17 +279,46 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, **mixer_kwargs):
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        attention_mask=None,
+        inference_params=None,
+        num_last_tokens=0,
+        output_hidden_states=False,
+        return_dict=True,
+        **mixer_kwargs,
+    ):
         """
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
-        hidden_states = self.backbone(input_ids, inference_params=inference_params, **mixer_kwargs)
+        backbone_outputs = self.backbone(
+            input_ids,
+            inference_params=inference_params,
+            output_hidden_states=output_hidden_states,
+            **mixer_kwargs,
+        )
+
+        if output_hidden_states:
+            hidden_states, collected_hidden_states = backbone_outputs
+        else:
+            hidden_states = backbone_outputs
+            collected_hidden_states = None
+
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
-        CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
-        return CausalLMOutput(logits=lm_logits)
+
+        if not return_dict:
+            outputs = (lm_logits,)
+            if output_hidden_states:
+                outputs += (collected_hidden_states,)
+            return outputs
+
+        CausalLMOutput = namedtuple("CausalLMOutput", ["logits", "hidden_states"])
+        return CausalLMOutput(logits=lm_logits, hidden_states=collected_hidden_states)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):
