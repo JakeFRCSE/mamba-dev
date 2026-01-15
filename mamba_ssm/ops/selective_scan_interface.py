@@ -28,6 +28,25 @@ def reset_mamba_controller():
     """Reset the current layer index in MAMBA_CONTROLLER."""
     MAMBA_CONTROLLER["current_layer_idx"] = 0
 
+# ==========================================
+# [Add] Optional hook for SSM state capture
+# ==========================================
+SELECTIVE_SCAN_HOOK = None
+
+def set_selective_scan_hook(hook):
+    """Register a hook called with last_state; set None to disable."""
+    global SELECTIVE_SCAN_HOOK
+    SELECTIVE_SCAN_HOOK = hook
+
+def _call_selective_scan_hook(last_state):
+    hook = SELECTIVE_SCAN_HOOK
+    if hook is None:
+        return
+    try:
+        hook(last_state.detach())
+    except Exception as exc:
+        print(f"[SelectiveScan hook error]: {exc}")
+
 try:
     from causal_conv1d import causal_conv1d_fn
     from causal_conv1d.cpp_functions import causal_conv1d_fwd_function, causal_conv1d_bwd_function, causal_conv1d_update_function
@@ -69,6 +88,7 @@ class SelectiveScanFn(torch.autograd.Function):
         ctx.delta_softplus = delta_softplus
         ctx.has_z = z is not None
         last_state = x[:, :, -1, 1::2]  # (batch, dim, dstate)
+        _call_selective_scan_hook(last_state)
         if not ctx.has_z:
             ctx.save_for_backward(u, delta, A, B, C, D, delta_bias, x)
             return out if not return_last_state else (out, last_state)
@@ -200,6 +220,8 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     if z is not None:
         out = out * F.silu(z)
     out = out.to(dtype=dtype_in)
+    if last_state is not None:
+        _call_selective_scan_hook(last_state)
     return out if not return_last_state else (out, last_state)
 
 
@@ -337,6 +359,8 @@ class MambaInnerFn(torch.autograd.Function):
         out, scan_intermediates, out_z = selective_scan_cuda.fwd(
             conv1d_out, delta, A, B, C, D, z, delta_bias, delta_softplus
         )
+        if scan_intermediates is not None and scan_intermediates.dim() >= 4:
+            _call_selective_scan_hook(scan_intermediates[:, :, -1, 1::2])
         ctx.delta_softplus = delta_softplus
         ctx.out_proj_bias_is_None = out_proj_bias is None
         ctx.checkpoint_lvl = checkpoint_lvl

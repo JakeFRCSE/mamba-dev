@@ -191,10 +191,10 @@ class Mamba(nn.Module):
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             
-            # ------------------------------------------------------------------
+            # ============================================================
             # [Add] Steering logic insertion point
             # dt is calculated and before entering state update (SSM).
-            # ------------------------------------------------------------------
+            # ============================================================
             try:
                 current_layer = self.layer_idx 
                 target_layers = MAMBA_CONTROLLER.get("target_layers", [])
